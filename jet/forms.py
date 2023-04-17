@@ -1,14 +1,15 @@
 import json
+import operator
+from functools import reduce
+
 from django import forms
 from django.contrib.auth.models import Permission
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db.models import Q
-import operator
-
 from jet.models import Bookmark, PinnedApplication
 from jet.utils import get_model_instance_label, user_is_authenticated
-from functools import reduce
+
 
 try:
     from django.apps import apps
@@ -118,34 +119,69 @@ class ModelLookupForm(forms.Form):
             raise ValidationError('error')
 
         content_type = ContentType.objects.get_for_model(self.model_cls)
-        permission = Permission.objects.filter(content_type=content_type, codename__startswith='change_').first()
 
-        if not self.request.user.has_perm('{}.{}'.format(data['app_label'], permission.codename)):
-            raise ValidationError('error')
+        # User needs view or change permission on the object
+        permissions = Permission.objects.filter(
+            Q(
+                codename__startswith='change_'
+            ) | Q(
+                codename__startswith='view_'
+            ), content_type=content_type
+        )
+
+        permission_granted = False
+        for permission in permissions:
+            if self.request.user.has_perm(f"{data['app_label']}.{permission.codename}"):
+                permission_granted = True
+                break
+
+        if not permission_granted:
+            raise ValidationError(f'Permission denied for {self.model_cls} to the current user.')
 
         return data
 
-    def lookup(self):
-        qs = self.model_cls.objects
-
-        if self.cleaned_data['q']:
-            if getattr(self.model_cls, 'autocomplete_search_fields', None):
+    def lookup(self, user=None):
+        if 'q' in self.cleaned_data:
+            if hasattr(self.model_cls, 'autocomplete_search_fields') and hasattr(
+                self.model_cls,
+                'autocomplete_search_query'
+            ):
+                raise NotImplementedError(
+                    f'The model {self.model_cls} cannot have both an autocomplete_search_fields '
+                    f'and autocomplete_search_query function. Make up your mind.'
+                )
+            elif hasattr(self.model_cls, 'autocomplete_search_query'):
+                qs = self.model_cls.autocomplete_search_query(self.cleaned_data['q'],
+                    user).distinct()
+            elif hasattr(self.model_cls, 'autocomplete_search_fields'):
+                qs = self.model_cls.objects
                 search_fields = self.model_cls.autocomplete_search_fields()
-                filter_data = [Q((field + '__icontains', self.cleaned_data['q'])) for field in search_fields]
-                # if self.cleaned_data['object_id']:
-                #     filter_data.append(Q(pk=self.cleaned_data['object_id']))
+                filter_data = [
+                    Q((field + '__icontains', self.cleaned_data['q']))
+                    for field in search_fields
+                ]
                 qs = qs.filter(reduce(operator.or_, filter_data)).distinct()
             else:
-                qs = qs.none()
-
+                qs = self.model_cls.objects.none()
+        else:
+            qs = self.model_cls.objects.none()
         limit = self.cleaned_data['page_size'] or 100
         page = self.cleaned_data['page'] or 1
         offset = (page - 1) * limit
-
-        items = list(map(
-            lambda instance: {'id': instance.pk, 'text': get_model_instance_label(instance)},
-            qs.all()[offset:offset + limit]
-        ))
-        total = qs.count()
-
-        return items, total
+        items = qs[offset:offset + limit]
+        # Optional post-processing in Python.
+        if hasattr(self.model_cls, 'autocomplete_search_filter'):
+            items = self.model_cls.autocomplete_search_filter(items)
+            # Total query count not known in case of post-processing in Python.
+            count = None
+        else:
+            count = qs.count()
+        items = list(
+            map(
+                lambda instance: {
+                    'id': instance.pk,
+                    'text': get_model_instance_label(instance)
+                }, items
+            )
+        )
+        return items, count
